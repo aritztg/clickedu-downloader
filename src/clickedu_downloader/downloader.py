@@ -277,18 +277,24 @@ class ClickeduDownloader:
         Args:
             album_url: Full URL of the album page.
             album_name: Human-readable name (used as folder name).
-            description: Album description to save as album_info.txt.
+            description: Fallback description from listing page (rarely populated).
         """
         album_dir = self.download_dir / album_name
         album_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save description (always overwrite with latest)
-        info_path = album_dir / "album_info.txt"
-        if description and not info_path.exists():
-            info_path.write_text(description, encoding="utf-8")
-
         # Fetch album page
         resp = self.session.get(album_url, impersonate="chrome")  # type: ignore[union-attr]
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Extract description from album page (div.xxxPerSobre)
+        desc_div = soup.find("div", class_="xxxPerSobre")
+        album_description = desc_div.get_text(strip=True) if desc_div else description
+
+        # Save description as description.txt
+        desc_path = album_dir / "description.txt"
+        if album_description and album_description != "No disposeu de permisos.":
+            desc_path.write_text(album_description, encoding="utf-8")
+
         photos = self._extract_photos_from_album(resp.text)
 
         if not photos:
