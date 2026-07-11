@@ -11,7 +11,6 @@ import pytest
 
 from clickedu_downloader.downloader import ClickeduDownloader
 
-
 # ── JPEG fixtures ────────────────────────────────────────────────────
 
 @pytest.fixture(scope="session")
@@ -150,13 +149,13 @@ def test_extract_photos_no_gallery() -> None:
 
 def test_default_base_url() -> None:
     d = ClickeduDownloader()
-    assert d.BASE_URL == "https://dominiquesbcn.clickedu.eu"
+    assert d.base_url == "https://dominiquesbcn.clickedu.eu"
 
 
 def test_custom_base_url() -> None:
     d = ClickeduDownloader(base_url="https://myschool.clickedu.eu")
-    assert d.BASE_URL == "https://myschool.clickedu.eu"
-    assert d.LOGIN_URL == "https://myschool.clickedu.eu/user.php?action=doLogin"
+    assert d.base_url == "https://myschool.clickedu.eu"
+    assert d.login_url == "https://myschool.clickedu.eu/user.php?action=doLogin"
 
 
 def test_default_download_dir() -> None:

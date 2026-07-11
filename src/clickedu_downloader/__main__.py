@@ -6,6 +6,7 @@ from clickedu_downloader import ClickeduDownloader
 
 
 def main() -> None:
+    """Configure logging and run the album downloader."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(message)s",

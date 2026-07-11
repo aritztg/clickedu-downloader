@@ -25,9 +25,7 @@ load_dotenv()
 class ClickeduDownloader:
     """Download all photo albums from a Clickedu school platform."""
 
-    BASE_URL = "https://dominiquesbcn.clickedu.eu"
-    LOGIN_URL = f"{BASE_URL}/user.php?action=doLogin"
-    ALBUMS_URL = f"{BASE_URL}/students/albums_fotos.php"
+    DEFAULT_BASE_URL = "https://dominiquesbcn.clickedu.eu"
 
     def __init__(self, base_url: str | None = None, download_dir: str = "downloads") -> None:
         """
@@ -35,10 +33,9 @@ class ClickeduDownloader:
             base_url: Clickedu site URL (defaults to Dominiques BCN).
             download_dir: Root directory for downloaded albums.
         """
-        if base_url:
-            self.BASE_URL = base_url
-            self.LOGIN_URL = f"{base_url}/user.php?action=doLogin"
-            self.ALBUMS_URL = f"{base_url}/students/albums_fotos.php"
+        self.base_url = base_url or self.DEFAULT_BASE_URL
+        self.login_url = f"{self.base_url}/user.php?action=doLogin"
+        self.albums_url = f"{self.base_url}/students/albums_fotos.php"
 
         self.download_dir = Path(download_dir)
         self.session: requests.Session | None = None
@@ -55,7 +52,7 @@ class ClickeduDownloader:
 
         self.session = requests.Session()
         resp = self.session.post(
-            self.LOGIN_URL,
+            self.login_url,
             data={"username": username, "password": password},
             impersonate="chrome",
         )
@@ -74,7 +71,7 @@ class ClickeduDownloader:
         page = 1
 
         while True:
-            url = f"{self.ALBUMS_URL}?accio=llistar&pag={page}&lloc=fotos"
+            url = f"{self.albums_url}?accio=llistar&pag={page}&lloc=fotos"
             resp = self.session.get(url, impersonate="chrome")  # type: ignore[union-attr]
             soup = BeautifulSoup(resp.text, "html.parser")
             containers = soup.find_all("div", class_="foto_albums_llistat_2")
@@ -109,7 +106,7 @@ class ClickeduDownloader:
             if not link or not name_div:
                 continue
 
-            album_url = self.BASE_URL + "/students/" + link["href"]
+            album_url = self.base_url + "/students/" + link["href"]
             name = (
                 name_div.get_text(strip=True)
                 .split("(")[0]
@@ -150,7 +147,7 @@ class ClickeduDownloader:
         try:
             exif = piexif.load(image_bytes)
             return piexif.ExifIFD.DateTimeOriginal in exif.get("Exif", {})
-        except Exception:
+        except (ValueError, piexif.InvalidImageDataError, OSError):
             return False
 
     @staticmethod
@@ -211,7 +208,7 @@ class ClickeduDownloader:
 
         try:
             exif_dict = piexif.load(str(image_path))
-        except Exception:
+        except (ValueError, piexif.InvalidImageDataError, OSError):
             exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
 
         # Already has date? skip
@@ -243,7 +240,7 @@ class ClickeduDownloader:
         try:
             resp = self.session.get(photo_url, timeout=30, impersonate="chrome")  # type: ignore[union-attr]
             resp.raise_for_status()
-        except Exception:
+        except requests.RequestsError:
             logger.error("✗ Download failed: %s", photo_url, exc_info=True)
             return False
 
@@ -269,6 +266,26 @@ class ClickeduDownloader:
 
         return True
 
+    @staticmethod
+    def _count_existing_photos(album_dir: Path, total: int) -> int:
+        """Count how many photos already exist on disk (any extension case)."""
+        extensions_lower = [".jpg", ".jpeg", ".png", ".gif", ".webp"]
+        extensions_upper = [ext.upper() for ext in extensions_lower]
+        return sum(
+            1 for i in range(1, total + 1)
+            if (album_dir / f"{i:04d}.jpg").exists()
+            or any((album_dir / f"{i:04d}{ext}").exists() for ext in extensions_lower)
+            or any((album_dir / f"{i:04d}{ext}").exists() for ext in extensions_upper)
+        )
+
+    @staticmethod
+    def _save_album_description(album_dir: Path, soup: BeautifulSoup, fallback: str = "") -> None:
+        """Extract and save album description from the page's xxxPerSobre div."""
+        desc_div = soup.find("div", class_="xxxPerSobre")
+        description = desc_div.get_text(strip=True) if desc_div else fallback
+        if description and description != "No disposeu de permisos.":
+            (album_dir / "description.txt").write_text(description, encoding="utf-8")
+
     def download_album(self, album_url: str, album_name: str, description: str = "") -> None:
         """Download all photos from a single album.
 
@@ -282,18 +299,10 @@ class ClickeduDownloader:
         album_dir = self.download_dir / album_name
         album_dir.mkdir(parents=True, exist_ok=True)
 
-        # Fetch album page
+        # Fetch album page and save description
         resp = self.session.get(album_url, impersonate="chrome")  # type: ignore[union-attr]
         soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Extract description from album page (div.xxxPerSobre)
-        desc_div = soup.find("div", class_="xxxPerSobre")
-        album_description = desc_div.get_text(strip=True) if desc_div else description
-
-        # Save description as description.txt
-        desc_path = album_dir / "description.txt"
-        if album_description and album_description != "No disposeu de permisos.":
-            desc_path.write_text(album_description, encoding="utf-8")
+        self._save_album_description(album_dir, soup, description)
 
         photos = self._extract_photos_from_album(resp.text)
 
@@ -302,18 +311,7 @@ class ClickeduDownloader:
             return
 
         # Count already-downloaded
-        existing = sum(
-            1 for i in range(1, len(photos) + 1)
-            if (album_dir / f"{i:04d}.jpg").exists()
-            or any(
-                (album_dir / f"{i:04d}{ext}").exists()
-                for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]
-            )
-            or any(
-                (album_dir / f"{i:04d}{ext}").exists()
-                for ext in [".JPG", ".JPEG", ".PNG", ".GIF", ".WEBP"]
-            )
-        )
+        existing = self._count_existing_photos(album_dir, len(photos))
 
         new_photos = len(photos) - existing
         if new_photos == 0:
