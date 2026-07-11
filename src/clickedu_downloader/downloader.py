@@ -1,18 +1,24 @@
 """Clickedu photo album downloader using curl_cffi."""
 
+from __future__ import annotations
+
+import contextlib
+import getpass
 import os
 import re
-import getpass
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 import piexif
-from curl_cffi import requests
 from bs4 import BeautifulSoup
+from curl_cffi import requests
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 console = Console()
+
+load_dotenv()
 
 
 class ClickeduDownloader:
@@ -41,14 +47,10 @@ class ClickeduDownloader:
     def login(self, username: str | None = None, password: str | None = None) -> None:
         """Authenticate with Clickedu and store the session.
 
-        Args:
-            username: Clickedu username. Prompts if not provided.
-            password: Clickedu password. Prompts if not provided.
+        Credentials are resolved in order: argument → CLICKEDU_USER/CLICKEDU_PASS env vars → prompt.
         """
-        if not username:
-            username = input("Clickedu username: ")
-        if not password:
-            password = getpass.getpass("Clickedu password: ")
+        username = username or os.getenv("CLICKEDU_USER") or input("Clickedu username: ")
+        password = password or os.getenv("CLICKEDU_PASS") or getpass.getpass("Clickedu password: ")
 
         self.session = requests.Session()
         resp = self.session.post(
@@ -142,12 +144,39 @@ class ClickeduDownloader:
     # ── EXIF helpers ────────────────────────────────────────────────
 
     @staticmethod
+    def _has_exif_date(image_bytes: bytes) -> bool:
+        """Check if image bytes already have a DateTimeOriginal EXIF tag."""
+        try:
+            exif = piexif.load(image_bytes)
+            return piexif.ExifIFD.DateTimeOriginal in exif.get("Exif", {})
+        except Exception:
+            return False
+
+    @staticmethod
     def _extract_datetime_from_filename(filename: str) -> datetime | None:
         """Try to extract a datetime from common filename patterns.
 
-        Patterns: YYYYMMDD_HHMMSS, IMG_YYYYMMDD_HHMMSS, etc.
+        Patterns supported:
+            - UNIX millisecond timestamps: 1781603067258.jpg
+            - YYYYMMDD_HHMMSS: 20241005_143000
+            - ISO-ish: 2024-10-05 14:30, 20241005-1430
         """
-        # Try ISO-ish patterns embedded in filenames
+        basename = Path(filename).stem
+
+        # UNIX millisecond timestamp (13 digits)
+        if re.match(r"^\d{13}$", basename):
+            try:
+                return datetime.fromtimestamp(int(basename) / 1000)
+            except (ValueError, OSError):
+                pass
+
+        # UNIX second timestamp (10 digits)
+        if re.match(r"^\d{10}$", basename):
+            try:
+                return datetime.fromtimestamp(int(basename))
+            except (ValueError, OSError):
+                pass
+
         patterns = [
             r"(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})",  # 20241005_143000
             r"(\d{4})-(\d{2})-(\d{2})[T _](\d{2})[.:](\d{2})",  # 2024-10-05 14:30
@@ -155,7 +184,7 @@ class ClickeduDownloader:
         ]
 
         for pattern in patterns:
-            match = re.search(pattern, filename)
+            match = re.search(pattern, basename)
             if match:
                 groups = match.groups()
                 try:
@@ -164,7 +193,7 @@ class ClickeduDownloader:
                             int(groups[0]), int(groups[1]), int(groups[2]),
                             int(groups[3]), int(groups[4]), int(groups[5]),
                         )
-                    elif len(groups) == 5:
+                    if len(groups) == 5:
                         return datetime(
                             int(groups[0]), int(groups[1]), int(groups[2]),
                             int(groups[3]), int(groups[4]), 0,
@@ -184,6 +213,10 @@ class ClickeduDownloader:
         except Exception:
             exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
 
+        # Already has date? skip
+        if piexif.ExifIFD.DateTimeOriginal in exif_dict.get("Exif", {}):
+            return
+
         exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = dt_str
         exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = dt_str
 
@@ -195,9 +228,16 @@ class ClickeduDownloader:
     def download_photo(self, photo_url: str, dest_path: Path) -> bool:
         """Download a single photo and set its EXIF date if missing.
 
+        Idempotent: skips download if the file already exists.
+        Skips EXIF injection if DateTimeOriginal is already present.
+
         Returns:
-            True on success, False on failure.
+            True on success (or already present), False on download failure.
         """
+        # Idempotency: skip if already downloaded
+        if dest_path.exists():
+            return True
+
         try:
             resp = self.session.get(photo_url, timeout=30, impersonate="chrome")  # type: ignore[union-attr]
             resp.raise_for_status()
@@ -205,27 +245,22 @@ class ClickeduDownloader:
             console.print(f"    [red]✗ download failed: {photo_url} — {exc}[/]")
             return False
 
-        dest_path.write_bytes(resp.content)
+        content = resp.content
+        dest_path.write_bytes(content)
 
-        # Check for EXIF DateTimeOriginal
-        try:
-            exif = piexif.load(resp.content)
-            has_date = piexif.ExifIFD.DateTimeOriginal in exif.get("Exif", {})
-        except Exception:
-            has_date = False
-
-        if not has_date:
+        # Only inject EXIF date if the photo doesn't already have one
+        if not self._has_exif_date(content):
             dt = self._extract_datetime_from_filename(photo_url)
             if dt:
-                try:
+                with contextlib.suppress(Exception):
                     self._set_exif_datetime(dest_path, dt)
-                except Exception:
-                    pass  # non-critical
 
         return True
 
     def download_album(self, album_url: str, album_name: str, description: str = "") -> None:
         """Download all photos from a single album.
+
+        Idempotent: skips already-downloaded photos.
 
         Args:
             album_url: Full URL of the album page.
@@ -235,9 +270,10 @@ class ClickeduDownloader:
         album_dir = self.download_dir / album_name
         album_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save description
-        if description:
-            (album_dir / "album_info.txt").write_text(description, encoding="utf-8")
+        # Save description (always overwrite with latest)
+        info_path = album_dir / "album_info.txt"
+        if description and not info_path.exists():
+            info_path.write_text(description, encoding="utf-8")
 
         # Fetch album page
         resp = self.session.get(album_url, impersonate="chrome")  # type: ignore[union-attr]
@@ -247,7 +283,18 @@ class ClickeduDownloader:
             console.print(f"  [yellow]⚠ no photos found in '{album_name}'[/]")
             return
 
-        console.print(f"  📁 [bold]{album_name}[/] — {len(photos)} photos")
+        # Count already-downloaded
+        existing = sum(1 for i in range(1, len(photos) + 1)
+                       if (album_dir / f"{i:04d}.jpg").exists()
+                       or any((album_dir / f"{i:04d}{ext}").exists()
+                              for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]))
+
+        new_photos = len(photos) - existing
+        if new_photos == 0:
+            console.print(f"  📁 [bold]{album_name}[/] — {len(photos)} photos (all cached)")
+            return
+
+        console.print(f"  📁 [bold]{album_name}[/] — {new_photos} new / {len(photos)} total")
 
         for i, photo_url in enumerate(photos, 1):
             ext = Path(photo_url).suffix or ".jpg"
