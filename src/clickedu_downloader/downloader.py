@@ -8,6 +8,7 @@ import logging
 import os
 import re
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import piexif
@@ -230,6 +231,7 @@ class ClickeduDownloader:
 
         Idempotent: skips download if the file already exists.
         Skips EXIF injection if DateTimeOriginal is already present.
+        Preserves the server's Last-Modified timestamp on the local file.
 
         Returns:
             True on success (or already present), False on download failure.
@@ -247,6 +249,16 @@ class ClickeduDownloader:
 
         content = resp.content
         dest_path.write_bytes(content)
+
+        # Preserve server's Last-Modified as local file mtime (not EXIF)
+        last_modified = resp.headers.get("Last-Modified")
+        if last_modified:
+            try:
+                server_dt = parsedate_to_datetime(last_modified)
+                ts = server_dt.timestamp()
+                os.utime(dest_path, (ts, ts))
+            except (ValueError, OSError):
+                pass
 
         # Only inject EXIF date if the photo doesn't already have one
         if not self._has_exif_date(content):
@@ -291,6 +303,10 @@ class ClickeduDownloader:
                 (album_dir / f"{i:04d}{ext}").exists()
                 for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]
             )
+            or any(
+                (album_dir / f"{i:04d}{ext}").exists()
+                for ext in [".JPG", ".JPEG", ".PNG", ".GIF", ".WEBP"]
+            )
         )
 
         new_photos = len(photos) - existing
@@ -301,7 +317,7 @@ class ClickeduDownloader:
         logger.info("  📁 %s — %d new / %d total", album_name, new_photos, len(photos))
 
         for i, photo_url in enumerate(photos, 1):
-            ext = Path(photo_url).suffix or ".jpg"
+            ext = Path(photo_url).suffix.lower() or ".jpg"
             dest = album_dir / f"{i:04d}{ext}"
             self.download_photo(photo_url, dest)
 
