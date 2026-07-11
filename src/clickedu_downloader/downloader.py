@@ -236,8 +236,8 @@ class ClickeduDownloader:
         Returns:
             True on success (or already present), False on download failure.
         """
-        # Idempotency: skip if already downloaded
-        if dest_path.exists():
+        # Idempotency: skip if already downloaded (check both case variants)
+        if dest_path.exists() or dest_path.with_suffix(dest_path.suffix.upper()).exists():
             return True
 
         try:
