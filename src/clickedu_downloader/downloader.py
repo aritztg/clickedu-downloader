@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import getpass
+import logging
 import os
 import re
 from datetime import datetime
@@ -13,10 +14,9 @@ import piexif
 from bs4 import BeautifulSoup
 from curl_cffi import requests
 from dotenv import load_dotenv
-from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from tqdm import tqdm
 
-console = Console()
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -28,7 +28,7 @@ class ClickeduDownloader:
     LOGIN_URL = f"{BASE_URL}/user.php?action=doLogin"
     ALBUMS_URL = f"{BASE_URL}/students/albums_fotos.php"
 
-    def __init__(self, base_url: str | None = None, download_dir: str = "downloads"):
+    def __init__(self, base_url: str | None = None, download_dir: str = "downloads") -> None:
         """
         Args:
             base_url: Clickedu site URL (defaults to Dominiques BCN).
@@ -60,9 +60,9 @@ class ClickeduDownloader:
         )
 
         if resp.status_code == 200 and "Iniciar" not in resp.text:
-            console.print("[green]✓ Login successful[/]")
+            logger.info("✓ Login successful")
         else:
-            console.print("[red]✗ Login failed — check credentials[/]")
+            logger.error("✗ Login failed — check credentials")
             raise PermissionError("Login failed")
 
     # ── album discovery ─────────────────────────────────────────────
@@ -82,7 +82,7 @@ class ClickeduDownloader:
                 break
 
             pages.append(url)
-            console.print(f"  · page {page}: {len(containers)} albums")
+            logger.debug("  · page %d: %d albums", page, len(containers))
 
             if len(containers) < 6:
                 break
@@ -241,8 +241,8 @@ class ClickeduDownloader:
         try:
             resp = self.session.get(photo_url, timeout=30, impersonate="chrome")  # type: ignore[union-attr]
             resp.raise_for_status()
-        except Exception as exc:
-            console.print(f"    [red]✗ download failed: {photo_url} — {exc}[/]")
+        except Exception:
+            logger.error("✗ Download failed: %s", photo_url, exc_info=True)
             return False
 
         content = resp.content
@@ -280,21 +280,25 @@ class ClickeduDownloader:
         photos = self._extract_photos_from_album(resp.text)
 
         if not photos:
-            console.print(f"  [yellow]⚠ no photos found in '{album_name}'[/]")
+            logger.warning("⚠ No photos found in '%s'", album_name)
             return
 
         # Count already-downloaded
-        existing = sum(1 for i in range(1, len(photos) + 1)
-                       if (album_dir / f"{i:04d}.jpg").exists()
-                       or any((album_dir / f"{i:04d}{ext}").exists()
-                              for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]))
+        existing = sum(
+            1 for i in range(1, len(photos) + 1)
+            if (album_dir / f"{i:04d}.jpg").exists()
+            or any(
+                (album_dir / f"{i:04d}{ext}").exists()
+                for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]
+            )
+        )
 
         new_photos = len(photos) - existing
         if new_photos == 0:
-            console.print(f"  📁 [bold]{album_name}[/] — {len(photos)} photos (all cached)")
+            logger.info("  📁 %s — %d photos (all cached)", album_name, len(photos))
             return
 
-        console.print(f"  📁 [bold]{album_name}[/] — {new_photos} new / {len(photos)} total")
+        logger.info("  📁 %s — %d new / %d total", album_name, new_photos, len(photos))
 
         for i, photo_url in enumerate(photos, 1):
             ext = Path(photo_url).suffix or ".jpg"
@@ -307,24 +311,16 @@ class ClickeduDownloader:
         """Authenticate and download all albums."""
         self.login(username, password)
 
-        console.print("\n[bold]Scanning album pages…[/]")
+        logger.info("Scanning album pages…")
         pages = self._fetch_album_pages()
-        console.print(f"  Found {len(pages)} page(s)\n")
 
         all_albums: list[tuple[str, str, str]] = []
         for page_url in pages:
             all_albums.extend(self._parse_albums_from_page(page_url))
 
-        console.print(f"[bold]Found {len(all_albums)} album(s)[/]\n")
+        logger.info("Found %d album(s)", len(all_albums))
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Downloading…", total=len(all_albums))
-            for album_url, name, desc in all_albums:
-                self.download_album(album_url, name, desc)
-                progress.advance(task)
+        for album_url, name, desc in tqdm(all_albums, desc="Downloading albums", unit="album"):
+            self.download_album(album_url, name, desc)
 
-        console.print(f"\n[green bold]✓ Done! Photos saved to {self.download_dir.resolve()}[/]")
+        logger.info("✓ Done! Photos saved to %s", self.download_dir.resolve())
