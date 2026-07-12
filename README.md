@@ -8,12 +8,20 @@ Download all photo albums from a [Clickedu](https://www.clickedu.eu/) school pla
 
 ## Features
 
-- **Full album download** — discovers and downloads every photo album
-- **EXIF date injection** — extracts dates from UNIX-timestamp filenames and writes `DateTimeOriginal` / `DateTimeDigitized` tags
-- **Server timestamps preserved** — sets the local file's modification time from the `Last-Modified` HTTP header (no fake EXIF dates)
-- **Album descriptions** — saves the teacher's Catalan description as `description.txt` inside each album folder
-- **Idempotent** — re-running only downloads new photos, never re-downloads
-- **Progress bar** — shows album-level progress with `tqdm`
+| Category | Feature |
+|---|---|
+| 🔍 **Discovery** | Auto-discovers every photo album across all pages |
+| ⚡ **Parallel** | Multi-threaded downloads with configurable worker count (default: 4) |
+| 🔄 **Retry** | Exponential backoff (2s → 4s → 8s) on failed photos via `tenacity` |
+| ✅ **Integrity** | Verifies `Content-Length` against actual bytes downloaded |
+| 📅 **EXIF dates** | Extracts dates from UNIX-timestamp filenames, writes `DateTimeOriginal` / `DateTimeDigitized` |
+| 🕐 **Server timestamps** | Sets local file `mtime` from `Last-Modified` HTTP header (no fake EXIF dates) |
+| 📝 **Descriptions** | Saves the teacher's description as `description.txt` in each album folder |
+| 📋 **Manifest** | Generates `albums.json` with metadata for every album (photos, EXIF date range, failures) |
+| 📊 **Summary** | Reports Downloaded / Cached / Failed counts, with per-album error breakdown |
+| 🏷️ **CLI** | Full argparse: `--album`, `--dry-run`, `--output`, `--workers`, `--verbose` |
+| 🔁 **Idempotent** | Re-running only downloads new photos; never re-downloads existing ones |
+| 📈 **Progress** | `tqdm` progress bars at album + photo level |
 
 ## Requirements
 
@@ -33,19 +41,15 @@ echo 'CLICKEDU_PASS=your-password' >> .env
 uvx --from git+https://github.com/aritztg/clickedu-downloader clickedu-downloader
 ```
 
-Photos are saved to `./downloads/` by default.
-
 ### Option 2: Clone and run
 
 ```bash
 git clone https://github.com/aritztg/clickedu-downloader.git
 cd clickedu-downloader
 
-# Create .env with credentials
 echo 'CLICKEDU_USER=your-username' > .env
 echo 'CLICKEDU_PASS=your-password' >> .env
 
-# Run with uv
 uvx --from . clickedu-downloader
 ```
 
@@ -59,12 +63,47 @@ uvx --from git+https://github.com/aritztg/clickedu-downloader clickedu-downloade
 # Clickedu password: ********
 ```
 
+## CLI Reference
+
+```
+clickedu-downloader [OPTIONS]
+```
+
+| Flag | Short | Default | Description |
+|---|---|---|---|
+| `--album` | `-a` | *(all)* | Download only albums matching this name (case-insensitive substring) |
+| `--output` | `-o` | `downloads` | Output directory for photos |
+| `--workers` | `-w` | `4` | Number of parallel download threads |
+| `--dry-run` | `-n` | *(off)* | Discover albums and show what would be downloaded, without actually downloading |
+| `--verbose` | `-v` | *(off)* | Enable debug-level logging |
+| `--url` | | Dominiques BCN | Clickedu site URL |
+
+### Examples
+
+```bash
+# Download everything (default)
+clickedu-downloader
+
+# Download a single album
+clickedu-downloader --album "BIRRETS I5"
+
+# Dry-run to see what's new
+clickedu-downloader --dry-run
+
+# Aggressive parallel download + custom output folder
+clickedu-downloader --workers 8 --output ~/Pictures/Colegio
+
+# Verbose logging for debugging
+clickedu-downloader --album "GIMCANA" --verbose
+```
+
 ## Output structure
 
 ```
 downloads/
+├── albums.json                    ← Manifest with all albums metadata
 ├── BIRRETS I5/
-│   ├── description.txt       ← Album description (Catalan)
+│   ├── description.txt            ← Album description (Catalan)
 │   ├── 0001.jpg
 │   ├── 0002.jpg
 │   └── ...
@@ -75,21 +114,43 @@ downloads/
 └── ...
 ```
 
+### `albums.json` manifest
+
+```json
+[
+  {
+    "name": "BIRRETS I5",
+    "description": "Els nens fan els birrets de graduació...",
+    "photos": 47,
+    "downloaded": 12,
+    "cached": 35,
+    "failed": 0,
+    "earliest_date": "2026-05-12T10:04:23",
+    "latest_date": "2026-06-10T14:30:15"
+  }
+]
+```
+
 ## How it works
 
-1. **Login** — authenticates with Clickedu via `curl-cffi` (Chrome fingerprint)
+1. **Login** — authenticates with Clickedu via `curl-cffi` (Chrome fingerprint impersonation)
 2. **Discovery** — paginates through the album listing to find all albums
-3. **Download** — for each album, fetches the page, extracts the description and photo URLs, downloads them
-4. **EXIF** — if the photo lacks `DateTimeOriginal`, tries to extract a date from the filename (UNIX timestamps, `YYYYMMDD_HHMMSS`, etc.)
-5. **Timestamps** — sets the file's `mtime` from the server's `Last-Modified` header
+3. **Download** — fetches each album page, extracts description + photo URLs, downloads photos in parallel with retry
+4. **EXIF** — if the photo lacks `DateTimeOriginal`, extracts a date from the filename (UNIX timestamps, `YYYYMMDD_HHMMSS`, etc.)
+5. **Integrity** — verifies that `Content-Length` matches the actual bytes written to disk
+6. **Timestamps** — sets the file's `mtime` from the server's `Last-Modified` header
+7. **Manifest** — writes `albums.json` with per-album stats and EXIF date ranges
 
 ## EXIF date extraction patterns
 
 | Filename pattern | Example | EXIF injected? |
 |---|---|---|
-| UNIX milliseconds | `1781603067258.jpg` | ✅ Yes |
+| UNIX milliseconds (13 digits) | `1781603067258.jpg` | ✅ Yes |
+| UNIX seconds (10 digits) | `1717000000.jpg` | ✅ Yes |
 | `YYYYMMDD_HHMMSS` | `20260619_100923.jpg` | ✅ Yes |
 | `IMG_YYYYMMDD_HHMMSS` | `IMG_20260619_101234.jpg` | ✅ Yes |
+| `YYYY-MM-DD HH:MM` / ISO | `2024-10-05 14:30.jpg` | ✅ Yes |
+| `YYYYMMDD-HHMM` | `20241005-1430.jpg` | ✅ Yes |
 | Camera-style (`IMG_XXXX`) | `IMG_1606.JPG` | ❌ No (no timestamp) |
 
 ## Development
@@ -100,10 +161,16 @@ cd clickedu-downloader
 uv sync
 
 # Lint
-uv run ruff check src/
+uv run ruff check src/ tests/
+
+# Tests
+uv run pytest -q
+
+# Pylint
+uv run pylint src/clickedu_downloader/
 
 # Run locally
-PYTHONPATH=src uv run python -m clickedu_downloader
+uv run clickedu-downloader --dry-run
 ```
 
 ## License
