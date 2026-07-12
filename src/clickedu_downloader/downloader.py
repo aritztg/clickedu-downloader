@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import contextlib
 import getpass
+import json
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -15,6 +18,7 @@ import piexif
 from bs4 import BeautifulSoup
 from curl_cffi import requests
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
@@ -22,23 +26,62 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 
-class ClickeduDownloader:
+@dataclass
+class AlbumStats:
+    """Per-album download statistics."""
+
+    name: str
+    total: int = 0
+    downloaded: int = 0
+    cached: int = 0
+    failed: int = 0
+    description: str = ""
+
+
+@dataclass
+class DownloadStats:
+    """Aggregate download statistics."""
+
+    albums: list[AlbumStats] = field(default_factory=list)
+    total_photos: int = 0
+    total_downloaded: int = 0
+    total_cached: int = 0
+    total_failed: int = 0
+
+    @property
+    def failed_albums(self) -> list[AlbumStats]:
+        """Albums that had at least one failed download."""
+        return [a for a in self.albums if a.failed > 0]
+
+
+class ClickeduDownloader:  # pylint: disable=too-many-instance-attributes
     """Download all photo albums from a Clickedu school platform."""
 
     DEFAULT_BASE_URL = "https://dominiquesbcn.clickedu.eu"
 
-    def __init__(self, base_url: str | None = None, download_dir: str = "downloads") -> None:
+    def __init__(
+        self,
+        base_url: str | None = None,
+        download_dir: str = "downloads",
+        workers: int = 4,
+        dry_run: bool = False,
+    ) -> None:
         """
         Args:
             base_url: Clickedu site URL (defaults to Dominiques BCN).
             download_dir: Root directory for downloaded albums.
+            workers: Number of parallel download threads.
+            dry_run: If True, discover albums but don't download.
         """
         self.base_url = base_url or self.DEFAULT_BASE_URL
         self.login_url = f"{self.base_url}/user.php?action=doLogin"
         self.albums_url = f"{self.base_url}/students/albums_fotos.php"
 
         self.download_dir = Path(download_dir)
+        self.workers = workers
+        self.dry_run = dry_run
         self.session: requests.Session | None = None
+        self.stats = DownloadStats()
 
     # ── authentication ──────────────────────────────────────────────
 
@@ -223,31 +266,48 @@ class ClickeduDownloader:
 
     # ── download ────────────────────────────────────────────────────
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        reraise=True,
+    )
+    def _fetch_photo(self, photo_url: str) -> requests.Response:
+        """Fetch a single photo with retry on failure."""
+        resp = self.session.get(photo_url, timeout=30, impersonate="chrome")  # type: ignore[union-attr]
+        resp.raise_for_status()
+        return resp
+
     def download_photo(self, photo_url: str, dest_path: Path) -> bool:
         """Download a single photo and set its EXIF date if missing.
 
         Idempotent: skips download if the file already exists.
-        Skips EXIF injection if DateTimeOriginal is already present.
-        Preserves the server's Last-Modified timestamp on the local file.
+        Retries up to 3 times with exponential backoff.
+        Verifies Content-Length matches downloaded bytes.
 
         Returns:
-            True on success (or already present), False on download failure.
+            True on success (or already present), False on failure.
         """
-        # Idempotency: skip if already downloaded (check both case variants)
         if dest_path.exists() or dest_path.with_suffix(dest_path.suffix.upper()).exists():
             return True
 
         try:
-            resp = self.session.get(photo_url, timeout=30, impersonate="chrome")  # type: ignore[union-attr]
-            resp.raise_for_status()
+            resp = self._fetch_photo(photo_url)
         except requests.RequestsError:
-            logger.error("✗ Download failed: %s", photo_url, exc_info=True)
+            logger.error("✗ Download failed after retries: %s", photo_url)
             return False
 
         content = resp.content
+        expected_length = resp.headers.get("Content-Length")
+        if expected_length and len(content) != int(expected_length):
+            logger.error(
+                "✗ Size mismatch for %s: expected %s, got %d",
+                photo_url, expected_length, len(content),
+            )
+            return False
+
         dest_path.write_bytes(content)
 
-        # Preserve server's Last-Modified as local file mtime (not EXIF)
+        # Preserve server's Last-Modified as local file mtime
         last_modified = resp.headers.get("Last-Modified")
         if last_modified:
             try:
@@ -266,6 +326,8 @@ class ClickeduDownloader:
 
         return True
 
+    # ── album helpers ───────────────────────────────────────────────
+
     @staticmethod
     def _count_existing_photos(album_dir: Path, total: int) -> int:
         """Count how many photos already exist on disk (any extension case)."""
@@ -279,56 +341,156 @@ class ClickeduDownloader:
         )
 
     @staticmethod
-    def _save_album_description(album_dir: Path, soup: BeautifulSoup, fallback: str = "") -> None:
-        """Extract and save album description from the page's xxxPerSobre div."""
+    def _save_album_description(album_dir: Path, soup: BeautifulSoup, fallback: str = "") -> str:
+        """Extract and save album description. Returns the description text."""
         desc_div = soup.find("div", class_="xxxPerSobre")
         description = desc_div.get_text(strip=True) if desc_div else fallback
         if description and description != "No disposeu de permisos.":
             (album_dir / "description.txt").write_text(description, encoding="utf-8")
+        return description
 
-    def download_album(self, album_url: str, album_name: str, description: str = "") -> None:
-        """Download all photos from a single album.
+    # ── album download ──────────────────────────────────────────────
 
-        Idempotent: skips already-downloaded photos.
+    def _download_photos_parallel(self, photos: list[str], album_dir: Path, album_name: str) -> tuple[int, int]:
+        """Download photos in parallel and return (downloaded, failed) counts."""
+        downloaded = 0
+        failed = 0
+        futures: dict = {}
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            for i, photo_url in enumerate(photos, 1):
+                ext = Path(photo_url).suffix.lower() or ".jpg"
+                dest = album_dir / f"{i:04d}{ext}"
+                if dest.exists() or dest.with_suffix(dest.suffix.upper()).exists():
+                    continue
+                futures[executor.submit(self.download_photo, photo_url, dest)] = dest
 
-        Args:
-            album_url: Full URL of the album page.
-            album_name: Human-readable name (used as folder name).
-            description: Fallback description from listing page (rarely populated).
-        """
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc=f"  {album_name}",
+                unit="photo",
+                leave=False,
+            ):
+                if future.result():
+                    downloaded += 1
+                else:
+                    failed += 1
+        return downloaded, failed
+
+    def download_album(self, album_url: str, album_name: str, description: str = "") -> AlbumStats:
+        """Download all photos from a single album. Returns stats."""
         album_dir = self.download_dir / album_name
         album_dir.mkdir(parents=True, exist_ok=True)
 
-        # Fetch album page and save description
+        # Fetch album page
         resp = self.session.get(album_url, impersonate="chrome")  # type: ignore[union-attr]
         soup = BeautifulSoup(resp.text, "html.parser")
-        self._save_album_description(album_dir, soup, description)
+        album_description = self._save_album_description(album_dir, soup, description)
 
         photos = self._extract_photos_from_album(resp.text)
 
+        stats = AlbumStats(name=album_name, total=len(photos), description=album_description)
+
         if not photos:
             logger.warning("⚠ No photos found in '%s'", album_name)
-            return
+            return stats
 
-        # Count already-downloaded
         existing = self._count_existing_photos(album_dir, len(photos))
-
+        stats.cached = existing
         new_photos = len(photos) - existing
+
         if new_photos == 0:
             logger.info("  📁 %s — %d photos (all cached)", album_name, len(photos))
-            return
+            return stats
+
+        if self.dry_run:
+            logger.info("  📁 %s — %d new / %d total (dry-run)", album_name, new_photos, len(photos))
+            return stats
 
         logger.info("  📁 %s — %d new / %d total", album_name, new_photos, len(photos))
 
-        for i, photo_url in enumerate(photos, 1):
-            ext = Path(photo_url).suffix.lower() or ".jpg"
-            dest = album_dir / f"{i:04d}{ext}"
-            self.download_photo(photo_url, dest)
+        downloaded, failed = self._download_photos_parallel(photos, album_dir, album_name)
+        stats.downloaded = downloaded
+        stats.failed = failed
+
+        return stats
+
+    # ── manifest ────────────────────────────────────────────────────
+
+    def _generate_manifest(self, albums: list[AlbumStats]) -> None:
+        """Write albums.json manifest with metadata for all albums."""
+        manifest = []
+        for a in albums:
+            album_dir = self.download_dir / a.name
+            date_range = self._album_date_range(album_dir)
+            manifest.append({
+                "name": a.name,
+                "description": a.description,
+                "photos": a.total,
+                "downloaded": a.downloaded,
+                "cached": a.cached,
+                "failed": a.failed,
+                "earliest_date": date_range[0].isoformat() if date_range[0] else None,
+                "latest_date": date_range[1].isoformat() if date_range[1] else None,
+            })
+
+        path = self.download_dir / "albums.json"
+        path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        logger.info("📋 Manifest saved to %s", path)
+
+    @staticmethod
+    def _album_date_range(album_dir: Path) -> tuple[datetime | None, datetime | None]:
+        """Find the earliest and latest EXIF dates in an album folder."""
+        earliest: datetime | None = None
+        latest: datetime | None = None
+        for photo in sorted(album_dir.glob("*")):
+            if photo.suffix.lower() not in (".jpg", ".jpeg"):
+                continue
+            try:
+                exif = piexif.load(str(photo))
+                dt_str = exif.get("Exif", {}).get(piexif.ExifIFD.DateTimeOriginal)
+                if dt_str:
+                    dt = datetime.strptime(dt_str.decode(), "%Y:%m:%d %H:%M:%S")
+                    if earliest is None or dt < earliest:
+                        earliest = dt
+                    if latest is None or dt > latest:
+                        latest = dt
+            except (ValueError, piexif.InvalidImageDataError, OSError):
+                continue
+        return earliest, latest
+
+    # ── summary ─────────────────────────────────────────────────────
+
+    def _print_summary(self) -> None:
+        """Print download summary with error details."""
+        s = self.stats
+        logger.info("")
+        logger.info("=" * 50)
+        logger.info("📊 Download Summary")
+        logger.info("=" * 50)
+        logger.info("  Albums:       %d", len(s.albums))
+        logger.info("  Total photos: %d", s.total_photos)
+        logger.info("  Downloaded:   %d", s.total_downloaded)
+        logger.info("  Cached:       %d", s.total_cached)
+        logger.info("  Failed:       %d", s.total_failed)
+
+        if s.failed_albums:
+            logger.warning("")
+            logger.warning("⚠ Albums with failures:")
+            for a in s.failed_albums:
+                logger.warning("  - %s: %d/%d failed", a.name, a.failed, a.total)
+
+        logger.info("=" * 50)
 
     # ── top-level runner ────────────────────────────────────────────
 
-    def run(self, username: str | None = None, password: str | None = None) -> None:
-        """Authenticate and download all albums."""
+    def run(
+        self,
+        username: str | None = None,
+        password: str | None = None,
+        album_filter: str | None = None,
+    ) -> None:
+        """Authenticate and download all albums (or a single one if filtered)."""
         self.login(username, password)
 
         logger.info("Scanning album pages…")
@@ -338,9 +500,25 @@ class ClickeduDownloader:
         for page_url in pages:
             all_albums.extend(self._parse_albums_from_page(page_url))
 
+        if album_filter:
+            all_albums = [
+                (url, name, desc) for url, name, desc in all_albums
+                if album_filter.lower() in name.lower()
+            ]
+            if not all_albums:
+                logger.warning("No albums matching '%s'", album_filter)
+                return
+
         logger.info("Found %d album(s)", len(all_albums))
 
         for album_url, name, desc in tqdm(all_albums, desc="Downloading albums", unit="album"):
-            self.download_album(album_url, name, desc)
+            album_stats = self.download_album(album_url, name, desc)
+            self.stats.albums.append(album_stats)
+            self.stats.total_photos += album_stats.total
+            self.stats.total_downloaded += album_stats.downloaded
+            self.stats.total_cached += album_stats.cached
+            self.stats.total_failed += album_stats.failed
 
+        self._print_summary()
+        self._generate_manifest(self.stats.albums)
         logger.info("✓ Done! Photos saved to %s", self.download_dir.resolve())
