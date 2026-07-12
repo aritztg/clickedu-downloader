@@ -1,5 +1,9 @@
 # Clickedu Downloader
 
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/aritztg/clickedu-downloader/badges/ruff.json)](https://github.com/aritztg/clickedu-downloader/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/aritztg/clickedu-downloader/badges/tests.json)](https://github.com/aritztg/clickedu-downloader/actions/workflows/ci.yml)
+[![Pylint](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/aritztg/clickedu-downloader/badges/pylint.json)](https://github.com/aritztg/clickedu-downloader/actions/workflows/ci.yml)
+
 Download all photo albums from a [Clickedu](https://www.clickedu.eu/) school platform — preserving EXIF dates, album descriptions, and original file timestamps.
 
 ## Features

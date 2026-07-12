@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ruff:
+    name: Ruff Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.14"
+      - run: uv sync
+      - run: uv run ruff check src/ tests/
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    needs: ruff
+    outputs:
+      test_count: ${{ steps.parse.outputs.test_count }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.14"
+      - run: uv sync
+      - name: Run pytest
+        run: uv run pytest -q --tb=short 2>&1 | tee pytest.out
+      - name: Parse test count
+        id: parse
+        run: |
+          COUNT=$(grep -oP '\d+(?= passed)' pytest.out || echo "0")
+          echo "test_count=${COUNT}" >> "$GITHUB_OUTPUT"
+
+  lint:
+    name: Pylint Score
+    runs-on: ubuntu-latest
+    needs: ruff
+    outputs:
+      pylint_score: ${{ steps.parse.outputs.pylint_score }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.14"
+      - run: uv sync
+      - name: Run pylint
+        run: uv run pylint src/clickedu_downloader/ --output-format=text 2>&1 | tee pylint.out || true
+      - name: Parse pylint score
+        id: parse
+        run: |
+          SCORE=$(grep -oP 'rated at \K[\d.]+' pylint.out || echo "0.00")
+          echo "pylint_score=${SCORE}" >> "$GITHUB_OUTPUT"
+
+  badges:
+    name: Update Badges
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Determine colors
+        id: colors
+        run: |
+          TEST_COUNT="${{ needs.test.outputs.test_count }}"
+          PYLINT_SCORE="${{ needs.lint.outputs.pylint_score }}"
+
+          TEST_COLOR="brightgreen"
+          if [ -z "${TEST_COUNT}" ] || [ "${TEST_COUNT}" -eq 0 ]; then
+            TEST_COLOR="red"
+          fi
+
+          PYLINT_COLOR="brightgreen"
+          if [ -n "${PYLINT_SCORE}" ]; then
+            if [ "$(echo "${PYLINT_SCORE} < 9.0" | bc -l 2>/dev/null || echo 0)" -eq 1 ]; then
+              PYLINT_COLOR="red"
+            fi
+          fi
+
+          echo "test_color=${TEST_COLOR}" >> "$GITHUB_OUTPUT"
+          echo "pylint_color=${PYLINT_COLOR}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate badge JSONs
+        run: |
+          mkdir -p badges-out
+
+          cat > badges-out/tests.json << EOF
+          {
+            "schemaVersion": 1,
+            "label": "tests",
+            "message": "${{ needs.test.outputs.test_count }} passed",
+            "color": "${{ steps.colors.outputs.test_color }}"
+          }
+          EOF
+
+          cat > badges-out/pylint.json << EOF
+          {
+            "schemaVersion": 1,
+            "label": "pylint",
+            "message": "${{ needs.lint.outputs.pylint_score }}/10",
+            "color": "${{ steps.colors.outputs.pylint_color }}"
+          }
+          EOF
+
+          cat > badges-out/ruff.json << EOF
+          {
+            "schemaVersion": 1,
+            "label": "ruff",
+            "message": "passing",
+            "color": "brightgreen"
+          }
+          EOF
+
+      - name: Push badges branch
+        run: |
+          cd badges-out
+          git init
+          git checkout -b badges
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Update badges" || true
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" badges
